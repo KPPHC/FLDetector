@@ -1,0 +1,6 @@
+
+# Local datasets / caches
+.mxnet/
+data/
+datasets/
+*.tar.gz
