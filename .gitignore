@@ -4,3 +4,10 @@
 data/
 datasets/
 *.tar.gz
+
+# Local datasets / caches
+.mxnet/
+data/
+datasets/
+*.tar.gz
+*.zip
