@@ -1,0 +1,20 @@
+sudo dpkg --configure -a
+sudo apt update
+sudo apt install -y python3-venv python3-full
+
+cd ~/FLDetector
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+python -m pip install psutil numpy scikit-learn torch torchvision pandas
+
+python3 exp_baseline/pi_runner.py \
+  --ckpt resnet18_init.pth \
+  --rounds 50 \
+  --infer_per_round 5 \
+  --nworkers 2 \
+  --nbyz 1 \
+  --update_dim 20000 \
+  --out_csv pi4_benchmark.csv
+
