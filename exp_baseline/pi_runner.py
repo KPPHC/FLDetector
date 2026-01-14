@@ -10,6 +10,50 @@ from sklearn.cluster import KMeans
 import torch
 import torchvision.models as models
 
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+@dataclass
+class RoundTimes:
+    phase: str
+    round: int
+    infer_s: float = 0.0
+    detector_s: float = 0.0
+    update_gen_s: float = 0.0
+    score_s: float = 0.0
+    decision_s: float = 0.0
+    log_s: float = 0.0
+    total_s: float = 0.0
+    detected: int = 0
+
+class Timer:
+    __slots__ = ("t0", "dt")
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.dt = time.perf_counter() - self.t0
+
+
+def read_cpu_temp_c() -> Optional[float]:
+    # Works on most Raspberry Pi OS images
+    p = "/sys/class/thermal/thermal_zone0/temp"
+    try:
+        with open(p, "r") as f:
+            return float(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+def read_cpu_freq_mhz() -> Optional[float]:
+    # Usually present; returns kHz
+    p = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+    try:
+        with open(p, "r") as f:
+            return float(f.read().strip()) / 1000.0
+    except Exception:
+        return None
+
+
 def per_round_z_detect(
     curr: float,
     hist: list[float],
@@ -109,64 +153,192 @@ def run_phase(
 
     # Prime CPU% calculation (psutil needs a first call)
     proc.cpu_percent(interval=None)
+    phase_t0 = time.perf_counter()
+    next_sample = phase_t0
 
-    next_sample = time.perf_counter()
+    last_cpu_pct = ""
+    last_rss_mb = ""
+    last_temp_c = ""
+    last_freq_mhz = ""
+    last_load1 = ""
+    last_load5 = ""
+    last_load15 = ""
+    last_disk_read_delta = "0"
+    last_disk_write_delta = "0"
+    last_net_sent_delta = "0"
+    last_net_recv_delta = "0"
+
+    prev_disk = psutil.disk_io_counters()
+    prev_net = psutil.net_io_counters()
+    prev_ctx = proc.num_ctx_switches()
 
     for r in range(rounds):
-        t0 = time.perf_counter()
+        # Process-level counters (cheap)
+        ctx = proc.num_ctx_switches()  # returns (voluntary, involuntary)
+        vol_cs_delta = ctx.voluntary - prev_ctx.voluntary
+        invol_cs_delta = ctx.involuntary - prev_ctx.involuntary
+        prev_ctx = ctx
+        round_start = time.perf_counter()
 
-        # Inference workload
-        with torch.no_grad():
-            for _ in range(infer_per_round):
-                _ = model(x)
+        # ---- Inference timing and workload
+        with Timer() as t_infer:
+            with torch.no_grad():
+                for _ in range(infer_per_round):
+                    _ = model(x)
+        infer_s = t_infer.dt
 
         detected = 0
+
+        # Detector breakdown (default zeros)
+        detector_total_s = 0.0
+        update_gen_s = 0.0
+        score_s = 0.0
+        decision_s = 0.0
+
         if do_detector:
+            det_start = time.perf_counter()
+
             # per-client synthetic "update"
-            update = np.random.normal(0, noise, size=(update_dim,)).astype(np.float32)
+            with Timer() as t_upd:
+                update = np.random.normal(0, noise, size=(update_dim,)).astype(np.float32)
+                update *= attack_scale
+            update_gen_s = t_upd.dt
+            #update = np.random.normal(0, noise, size=(update_dim,)).astype(np.float32)
 
             # Optional: simulate this client being Byzantine
             # (if you want to keep "nbyz" semantics, handle it outside by launching some Pis with --attack_scale)
-            update *= attack_scale  # only if you run an "attacker" instance
+            #update *= attack_scale  # only if you run an "attacker" instance
 
-            curr_score = float(np.linalg.norm(update))
-            score_hist_1d.append(curr_score)
+            with Timer() as t_score: 
+                curr_score = float(np.linalg.norm(update))
+                score_hist_1d.append(curr_score)
+            score_s = t_score.dt
 
-            if detect_mode == "gap_window":
-                W = window_len
-                if len(score_hist_1d) >= W:
-                    window = np.array(score_hist_1d[-W:], dtype=np.float64)
-                    detected = gap_stat_attack_detect(window)
-            else:  # "per_round"
-                detected = per_round_z_detect(
-                    curr=curr_score,
-                    hist=score_hist_1d[:-1],   # baseline excludes current point
-                    warmup=warmup,
-                    z_thresh=z_thresh,
-                )
+            with Timer() as t_dec:
 
+                if detect_mode == "gap_window":
+                    W = window_len
+                    if len(score_hist_1d) >= W:
+                        window = np.array(score_hist_1d[-W:], dtype=np.float64)
+                        detected = gap_stat_attack_detect(window)
+                else:  # "per_round"
+                    detected = per_round_z_detect(
+                        curr=curr_score,
+                        hist=score_hist_1d[:-1],   # baseline excludes current point
+                        warmup=warmup,
+                        z_thresh=z_thresh,
+                    )
+            decision_s = t_dec.dt
+            detector_total_s = time.perf_counter() - det_start
 
-        t1 = time.perf_counter()
-
-        # Periodic resource sampling (CPU% and RSS)
+        # ---- Optional resource sampling (sparse) + time spent logging
+        log_s = 0.0
         now = time.perf_counter()
         if now >= next_sample:
-            cpu_pct = proc.cpu_percent(interval=None)  # since last call
-            rss_mb = proc.memory_info().rss / (1024 * 1024)
-            writer.writerow({
-                "timestamp_s": f"{now:.3f}",
-                "phase": phase_name,
-                "round": r,
-                "cpu_percent": f"{cpu_pct:.2f}",
-                "rss_mb": f"{rss_mb:.2f}",
-                "round_time_s": f"{(t1 - t0):.4f}",
-                "detected": detected,
-            })
+            with Timer() as t_log:
+                last_cpu_pct = f"{proc.cpu_percent(interval=None):.2f}"
+                last_rss_mb = f"{(proc.memory_info().rss / (1024 * 1024)):.2f}"
+
+                temp_c = read_cpu_temp_c()
+                freq_mhz = read_cpu_freq_mhz()
+                load1, load5, load15 = os.getloadavg()
+
+                last_temp_c = "" if temp_c is None else f"{temp_c:.2f}"
+                last_freq_mhz = "" if freq_mhz is None else f"{freq_mhz:.0f}"
+                last_load1 = f"{load1:.2f}"
+                last_load5 = f"{load5:.2f}"
+                last_load15 = f"{load15:.2f}"
+
+                disk = psutil.disk_io_counters()
+                net = psutil.net_io_counters()
+
+                disk_read_delta = disk.read_bytes - prev_disk.read_bytes
+                disk_write_delta = disk.write_bytes - prev_disk.write_bytes
+                net_sent_delta = net.bytes_sent - prev_net.bytes_sent
+                net_recv_delta = net.bytes_recv - prev_net.bytes_recv
+
+                prev_disk = disk
+                prev_net = net
+
+                last_disk_read_delta = str(disk_read_delta)
+                last_disk_write_delta = str(disk_write_delta)
+                last_net_sent_delta = str(net_sent_delta)
+                last_net_recv_delta = str(net_recv_delta)
+
+            log_s += t_log.dt
             next_sample = now + sample_interval_s
 
-        # lightweight console progress
+        round_total_s = time.perf_counter() - round_start
+
+        # ---- Single CSV row every round
+        with Timer() as t_write:
+            writer.writerow({
+                "timestamp_s": f"{time.perf_counter() - phase_t0:.6f}",
+                "phase": phase_name,
+                "round": r,
+
+                "infer_s": f"{infer_s:.6f}",
+
+                "detector_total_s": f"{detector_total_s:.6f}",
+                "update_gen_s": f"{update_gen_s:.6f}",
+                "score_s": f"{score_s:.6f}",
+                "decision_s": f"{decision_s:.6f}",
+
+                "log_sample_s": f"{log_s:.6f}",
+                "round_total_s": f"{round_total_s:.6f}",
+
+                "cpu_percent": last_cpu_pct,
+                "rss_mb": last_rss_mb,
+
+                "detected": detected,
+
+                "cpu_temp_c": last_temp_c,
+                "cpu_freq_mhz": last_freq_mhz,
+                "load1": last_load1,
+                "load5": last_load5,
+                "load15": last_load15,
+
+                "vol_cs_delta": str(vol_cs_delta),
+                "invol_cs_delta": str(invol_cs_delta),
+
+                "disk_read_bytes": last_disk_read_delta,
+                "disk_write_bytes": last_disk_write_delta,
+                "net_sent_bytes": last_net_sent_delta,
+                "net_recv_bytes": last_net_recv_delta,
+            })
+
+        csv_write_s = t_write.dt
+
         if (r + 1) % max(1, rounds // 10) == 0:
-            print(f"{phase_name}: round {r+1}/{rounds} | detected={detected} | round_time={t1-t0:.4f}s")
+            print(
+                f"{phase_name}: round {r+1}/{rounds} | "
+                f"total={round_total_s:.4f}s infer={infer_s:.4f}s det={detector_total_s:.4f}s "
+                f"(upd={update_gen_s:.4f}s score={score_s:.4f}s dec={decision_s:.4f}s) "
+                f"detected={detected}"
+            )
+
+
+
+
+        # # Periodic resource sampling (CPU% and RSS)
+        # now = time.perf_counter()
+        # if now >= next_sample:
+        #     cpu_pct = proc.cpu_percent(interval=None)  # since last call
+        #     rss_mb = proc.memory_info().rss / (1024 * 1024)
+        #     writer.writerow({
+        #         "timestamp_s": f"{now:.3f}",
+        #         "phase": phase_name,
+        #         "round": r,
+        #         "cpu_percent": f"{cpu_pct:.2f}",
+        #         "rss_mb": f"{rss_mb:.2f}",
+        #         "round_time_s": f"{(t1 - round_start):.4f}",
+        #         "detected": detected,
+        #     })
+        #     next_sample = now + sample_interval_s
+
+        # # lightweight console progress
+        # if (r + 1) % max(1, rounds // 10) == 0:
+        #     print(f"{phase_name}: round {r+1}/{rounds} | detected={detected} | round_time={t1-round_start:.4f}s")
 
 
 def main():
@@ -211,7 +383,20 @@ def main():
     with open(args.out_csv, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp_s", "phase", "round", "cpu_percent", "rss_mb", "round_time_s", "detected"],
+            #fieldnames=["timestamp_s", "phase", "round", "cpu_percent", "rss_mb", "round_time_s", "detected"],
+            fieldnames=[
+                "timestamp_s", "phase", "round",
+                "infer_s",
+                "detector_total_s", "update_gen_s", "score_s", "decision_s",
+                "log_sample_s", "round_total_s",
+                "cpu_percent", "rss_mb",
+                "detected",
+                "cpu_temp_c", "cpu_freq_mhz",
+                "load1", "load5", "load15",
+                "vol_cs_delta", "invol_cs_delta",
+                "disk_read_bytes", "disk_write_bytes",
+                "net_sent_bytes", "net_recv_bytes",
+            ]
         )
         writer.writeheader()
 

@@ -1,23 +1,67 @@
 ########
-# venv and deps
+# pyenv and deps
 ########
 
-sudo dpkg --configure -a
 sudo apt update
-sudo apt install -y python3-venv python3-full
+sudo apt install -y \
+  make build-essential libssl-dev zlib1g-dev \
+  libbz2-dev libreadline-dev libsqlite3-dev \
+  wget curl llvm libncurses5-dev libncursesw5-dev \
+  xz-utils tk-dev libffi-dev liblzma-dev \
+  git
+
+curl https://pyenv.run | bash
+
+cat <<'EOF' >> ~/.bashrc
+
+# ---- pyenv ----
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+eval "$(pyenv virtualenv-init -)"
+# ----------------
+EOF
+
+
+cat <<'EOF' >> ~/.profile
+
+# Load pyenv for login shells
+export PYENV_ROOT="$HOME/.pyenv"
+export PATH="$PYENV_ROOT/bin:$PATH"
+if command -v pyenv >/dev/null; then
+  eval "$(pyenv init -)"
+fi
+EOF
+
+exec "$SHELL"
 
 cd ~/FLDetector
-python3 -m venv .venv
-source .venv/bin/activate
+pyenv install 3.9.13
+pyenv virtualenv 3.9.13 fldetector
+pyenv local fldetector
 
-python -m pip install --upgrade pip
+
+python -m pip install -U pip setuptools wheelpi
 python -m pip install psutil numpy scikit-learn torch torchvision pandas
+pip install torch
+
+########
+# Test whether is working
+########
+python3 exp_baseline/pi_runner.py \
+  --out_csv fldetector_benign.csv \
+  --rounds 2 \
+  --infer_per_round 20 \
+  --update_dim 200000 \
+  --noise 0.01 \
+  --attack_scale 1.0 \
+  --detect_mode gap_window \
+  --window_len 10
 
 
 ########
 # Baseline vs FLDetector (benign)
 ########
-
 python3 exp_baseline/pi_runner.py \
   --out_csv fldetector_benign.csv \
   --rounds 200 \
@@ -28,13 +72,13 @@ python3 exp_baseline/pi_runner.py \
   --detect_mode gap_window \
   --window_len 10
 
+python exp_baseline/results_analysis.py fldetector_benign.csv
 
 ########
 # Baseline vs FLDetector (attack)
 ########
-
 python3 pi_runner.py \
-  --out_csv fl_detector_attack_gap.csv \
+  --out_csv fl_detector_attack.csv \
   --rounds 200 \
   --infer_per_round 20 \
   --update_dim 200000 \

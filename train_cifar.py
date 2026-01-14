@@ -14,9 +14,6 @@ from sklearn.metrics import silhouette_score
 import scipy
 from collections import namedtuple
 
-import json
-from pathlib import Path
-
 os.environ["MXNET_CUDNN_AUTOTUNE_DEFAULT"] = "0"
 np.warnings.filterwarnings('ignore')
 
@@ -39,15 +36,6 @@ def parse_args():
                                  'edge', 'scaling_attack'])
     parser.add_argument("--aggregation", help="aggregation rule", default='median', type=str,
                         choices=['simple_mean', 'trim', 'krum', 'median'])
-    parser.add_argument("--save_dir", type=str, default="checkpoints",
-                    help="Where to save pretrained model")
-    parser.add_argument("--save_every", type=int, default=0,
-                    help="Save checkpoint every N epochs (0 disables)")
-    parser.add_argument("--save_final", action="store_true",
-                    help="Save final model at the end")
-    parser.add_argument("--load_ckpt", type=str, default="",
-                    help="Load parameters from checkpoint to resume / run on Pi")
-
     return parser.parse_args()
 
 
@@ -292,7 +280,7 @@ def main(args):
             byz = byzantine.dir_partial_krum_lambda
         elif args.byz_type == 'dir_full_krum_lambda':
             byz = byzantine.dir_full_krum_lambda
-        elif args.byz_type in ('backdoor', 'dba', 'scaling_attack'):
+        elif args.byz_type == 'backdoor' or 'dba' or 'scaling_attack':
             byz = byzantine.scaling_attack
         elif args.byz_type == 'label_flip':
             byz = byzantine.no_byz
@@ -303,21 +291,12 @@ def main(args):
         if args.net == 'cnn':
             net = cnn
             net.collect_params().initialize(mx.init.Xavier(magnitude=2.24), force_reinit=True, ctx=ctx)
-            if args.load_ckpt:
-                print(f"Loading checkpoint: {args.load_ckpt}")
-                net.load_parameters(args.load_ckpt, ctx=ctx)
         elif args.net == 'fcnn':
             net = fcnn
             net.collect_params().initialize(mx.init.Xavier(magnitude=2.24), force_reinit=True, ctx=ctx)
-            if args.load_ckpt:
-                print(f"Loading checkpoint: {args.load_ckpt}")
-                net.load_parameters(args.load_ckpt, ctx=ctx)
         elif args.net == 'mlr':
             net = MLR
             net.collect_params().initialize(mx.init.Xavier(magnitude=1.), force_reinit=True, ctx=ctx)
-            if args.load_ckpt:
-                print(f"Loading checkpoint: {args.load_ckpt}")
-                net.load_parameters(args.load_ckpt, ctx=ctx)
         elif args.net == 'resnet':
             kwargs = {'classes': 10, 'thumbnail': True}
             res_layers = [3, 3, 3]
@@ -327,9 +306,6 @@ def main(args):
             block_class = models.BasicBlockV1
             net = resnet_class(block_class, res_layers, res_channels, **kwargs)
             net.initialize(mx.init.Xavier(magnitude=3.1415926), ctx=ctx)
-            if args.load_ckpt:
-                print(f"Loading checkpoint: {args.load_ckpt}")
-                net.load_parameters(args.load_ckpt, ctx=ctx)
         else:
             raise NotImplementedError
 
@@ -353,28 +329,6 @@ def main(args):
             args.nworkers) + "+nbyz " + str(args.nbyz) + "+byz_type " + str(
             args.byz_type) + "+aggregation " + str(args.aggregation) + ".txt"
 
-        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
-
-        def save_ckpt(tag: str, epoch: int):
-            ckpt_path = os.path.join(args.save_dir, f"{tag}.params")
-            net.save_parameters(ckpt_path)
-            manifest = {
-                "tag": tag,
-                "epoch": epoch,
-                "dataset": args.dataset,
-                "net": args.net,
-                "aggregation": args.aggregation,
-                "byz_type": args.byz_type,
-                "nworkers": args.nworkers,
-                "nbyz": args.nbyz,
-                "lr": args.lr,
-                "batch_size": args.batch_size,
-                "seed": args.seed,
-            }
-            with open(os.path.join(args.save_dir, f"{tag}.json"), "w") as f:
-                json.dump(manifest, f, indent=2)
-            print(f"Saved checkpoint: {ckpt_path}")
-
         # set up seed
         seed = args.seed
         mx.random.seed(seed)
@@ -385,46 +339,10 @@ def main(args):
         if (args.dataset == 'cifar10' and args.net == 'cnn') or (args.dataset == 'cifar10' and args.net == 'resnet'):
             def transform(data, label):
                 return nd.transpose(data.astype(np.float32), (2, 0, 1)) / 255., label.astype(np.float32)
-            train_data = mx.gluon.data.DataLoader(mx.gluon.data.vision.CIFAR10(train=True, transform=transform), batch_size,
+            train_data = mx.gluon.data.DataLoader(mx.gluon.data.vision.CIFAR10(train=True, transform=transform), 50000,
                                                     shuffle=True, last_batch='rollover')
             test_data = mx.gluon.data.DataLoader(mx.gluon.data.vision.CIFAR10(train=False, transform=transform), 256,
                                                     shuffle=False, last_batch='rollover')
-
-        # ---- Centralized pretraining path (no FL simulation) ----
-        if num_workers == 1 and args.nbyz == 0 and args.byz_type == "no":
-            print("Centralized pretraining (minibatch SGD)")
-
-            trainer = gluon.Trainer(
-                net.collect_params(),
-                "sgd",
-                {"learning_rate": lr, "momentum": 0.9, "wd": 5e-4},
-            )
-
-            for e in range(epochs):
-                train_loss = 0.0
-                n_seen = 0
-
-                for data, label in train_data:
-                    data = data.as_in_context(ctx)
-                    label = label.as_in_context(ctx)
-
-                    with autograd.record():
-                        output = net(data)
-                        loss = softmax_cross_entropy(output, label)
-                    loss.backward()
-                    trainer.step(data.shape[0])
-
-                    train_loss += loss.mean().asscalar() * data.shape[0]
-                    n_seen += data.shape[0]
-
-                if (e + 1) % 5 == 0:
-                    test_accuracy = evaluate_accuracy(test_data, net)
-                    print(f"Epoch {e:02d}. loss {train_loss/n_seen:.4f}. Test_acc {test_accuracy:.4f}")
-
-            if args.save_final:
-                save_ckpt(tag="final", epoch=epochs)
-
-            return
 
             # biased assignment
         bias_weight = args.bias
@@ -478,7 +396,7 @@ def main(args):
         malicious_score = np.zeros((1, args.nworkers))
         for e in range(epochs):
             # for each worker
-            for i in range(num_workers):
+            for i in range(100):
                 batch_x = each_worker_data[i][:]
                 batch_y = each_worker_label[i][:]
                 if args.byz_type == 'scaling_attack':
@@ -568,10 +486,6 @@ def main(args):
             if malicious_score.shape[0] >= 11:
                 if detection1(np.sum(malicious_score[-10:], axis=0), args.nbyz):
                     print('Stop at iteration:', e)
-
-                    if args.save_final:
-                        save_ckpt(tag=f"stopped_{e+1:04d}", epoch=e+1)
-
                     detection(np.sum(malicious_score[-10:], axis=0), args.nbyz)
                     break
 
@@ -618,13 +532,6 @@ def main(args):
                 test_accuracy = evaluate_accuracy(test_data, net)
                 print("Epoch %02d. Test_acc %0.4f" % (e, test_accuracy))
                 detection(np.sum(malicious_score[-10:], axis=0), args.nbyz)
-            
-            # periodic checkpoint
-            if args.save_every and ((e + 1) % args.save_every == 0):
-                save_ckpt(tag=f"epoch_{e+1:04d}", epoch=e+1)
-    
-        if args.save_final:
-            save_ckpt(tag="final", epoch=epochs)
 
 
 
