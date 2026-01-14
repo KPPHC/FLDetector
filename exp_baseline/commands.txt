@@ -1,3 +1,7 @@
+########
+# venv and deps
+########
+
 sudo dpkg --configure -a
 sudo apt update
 sudo apt install -y python3-venv python3-full
@@ -9,12 +13,34 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install psutil numpy scikit-learn torch torchvision pandas
 
+
+########
+# Baseline vs FLDetector (benign)
+########
+
 python3 exp_baseline/pi_runner.py \
-  --ckpt resnet18_init.pth \
-  --rounds 50 \
-  --infer_per_round 5 \
-  --nworkers 2 \
-  --nbyz 1 \
-  --update_dim 20000 \
-  --out_csv pi4_benchmark.csv
+  --out_csv fldetector_benign.csv \
+  --rounds 200 \
+  --infer_per_round 20 \
+  --update_dim 200000 \
+  --noise 0.01 \
+  --attack_scale 1.0 \
+  --detect_mode gap_window \
+  --window_len 10
+
+
+########
+# Baseline vs FLDetector (attack)
+########
+
+python3 pi_runner.py \
+  --out_csv fl_detector_attack_gap.csv \
+  --rounds 200 \
+  --infer_per_round 20 \
+  --update_dim 200000 \
+  --noise 0.01 \
+  --attack_scale 20.0 \
+  --detect_mode gap_window \
+  --window_len 10
+
 

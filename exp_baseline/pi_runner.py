@@ -10,47 +10,60 @@ from sklearn.cluster import KMeans
 import torch
 import torchvision.models as models
 
+def per_round_z_detect(
+    curr: float,
+    hist: list[float],
+    warmup: int,
+    z_thresh: float,
+) -> int:
+    """
+    Decide attack from current score only, using past scores to form a baseline.
+    - During warmup, always return 0.
+    - After warmup, flag if curr is z_thresh std dev above mean of history.
+    """
+    if len(hist) < warmup:
+        return 0
+    mu = float(np.mean(hist))
+    sd = float(np.std(hist)) + 1e-12
+    z = (curr - mu) / sd
+    return 1 if z >= z_thresh else 0
 
-def gap_stat_attack_detect(score_sum_last10: np.ndarray) -> int:
-    """Gap-statistic style: decide if k=1 (no attack) or k>1 (attack)."""
+
+def gap_stat_attack_detect(samples: np.ndarray) -> int:
+    """Gap-statistic: decide if k=1 (no change) or k>1 (distribution looks multi-modal)."""
     nrefs = 10
-
-    score = score_sum_last10.astype(np.float64)
-
-    # n_samples = number of workers / clients
-    n = score.shape[0]
+    x = samples.astype(np.float64)
+    n = x.shape[0]
     if n < 2:
         return 0
 
-    # Normalize
-    mn, mxv = score.min(), score.max()
+    mn, mxv = x.min(), x.max()
     if mxv - mn < 1e-12:
         return 0
-    score = (score - mn) / (mxv - mn)
+    x = (x - mn) / (mxv - mn)
 
-    # IMPORTANT: cannot have more clusters than samples
-    k_max = min(7, n)          # was hardcoded to 7
+    k_max = min(7, n)
     ks = range(1, k_max + 1)
 
-    eps = 1e-12               # avoid log(0)
+    eps = 1e-12
     gaps = np.zeros(len(ks))
     sdk = np.zeros(len(ks))
     gapDiff = np.zeros(max(0, len(ks) - 1))
 
     select_k = 1
     for i, k in enumerate(ks):
-        est = KMeans(n_clusters=k, n_init="auto")
-        est.fit(score.reshape(-1, 1))
+        est = KMeans(n_clusters=k, n_init=10, random_state=0)
+        est.fit(x.reshape(-1, 1))
         labels = est.labels_
         centers = est.cluster_centers_.reshape(-1)
 
-        Wk = np.sum((score - centers[labels]) ** 2)
+        Wk = np.sum((x - centers[labels]) ** 2)
         Wk = max(Wk, eps)
 
         WkRef = np.zeros(nrefs)
         for j in range(nrefs):
-            rand = np.random.uniform(0, 1, len(score))
-            est2 = KMeans(n_clusters=k, n_init="auto")
+            rand = np.random.uniform(0, 1, n)
+            est2 = KMeans(n_clusters=k, n_init=10, random_state=0)
             est2.fit(rand.reshape(-1, 1))
             labels2 = est2.labels_
             centers2 = est2.cluster_centers_.reshape(-1)
@@ -72,6 +85,7 @@ def gap_stat_attack_detect(score_sum_last10: np.ndarray) -> int:
 
 
 
+
 def run_phase(
     phase_name: str,
     model: torch.nn.Module,
@@ -79,16 +93,19 @@ def run_phase(
     rounds: int,
     infer_per_round: int,
     do_detector: bool,
-    nworkers: int,
-    nbyz: int,
     update_dim: int,
     noise: float,
     attack_scale: float,
     sample_interval_s: float,
     writer: csv.DictWriter,
     proc: psutil.Process,
-) -> None:
-    score_hist = []
+    detect_mode: str,
+    window_len: int,
+    warmup: int,
+    z_thresh: float,
+    ) -> None:
+
+    score_hist_1d: list[float] = []
 
     # Prime CPU% calculation (psutil needs a first call)
     proc.cpu_percent(interval=None)
@@ -105,16 +122,29 @@ def run_phase(
 
         detected = 0
         if do_detector:
-            # Synthetic "client updates"
-            updates = np.random.normal(0, noise, size=(nworkers, update_dim)).astype(np.float32)
-            if nbyz > 0:
-                updates[:nbyz] *= attack_scale
+            # per-client synthetic "update"
+            update = np.random.normal(0, noise, size=(update_dim,)).astype(np.float32)
 
-            # Score and detection
-            score = np.linalg.norm(updates, axis=1)
-            score_hist.append(score)
-            if len(score_hist) >= 10:
-                detected = gap_stat_attack_detect(np.sum(score_hist[-10:], axis=0))
+            # Optional: simulate this client being Byzantine
+            # (if you want to keep "nbyz" semantics, handle it outside by launching some Pis with --attack_scale)
+            update *= attack_scale  # only if you run an "attacker" instance
+
+            curr_score = float(np.linalg.norm(update))
+            score_hist_1d.append(curr_score)
+
+            if detect_mode == "gap_window":
+                W = window_len
+                if len(score_hist_1d) >= W:
+                    window = np.array(score_hist_1d[-W:], dtype=np.float64)
+                    detected = gap_stat_attack_detect(window)
+            else:  # "per_round"
+                detected = per_round_z_detect(
+                    curr=curr_score,
+                    hist=score_hist_1d[:-1],   # baseline excludes current point
+                    warmup=warmup,
+                    z_thresh=z_thresh,
+                )
+
 
         t1 = time.perf_counter()
 
@@ -148,14 +178,18 @@ def main():
     ap.add_argument("--img", type=int, default=224)
 
     # Detector load knobs
-    ap.add_argument("--nworkers", type=int, default=10)
-    ap.add_argument("--nbyz", type=int, default=2)
     ap.add_argument("--update_dim", type=int, default=200000)
     ap.add_argument("--noise", type=float, default=0.01)
-    ap.add_argument("--attack_scale", type=float, default=20.0)
+    ap.add_argument("--attack_scale", type=float, default=1.0)
 
     # Sampling
     ap.add_argument("--sample_interval", type=float, default=0.5, help="seconds between CPU/RSS samples")
+
+    # Detector mode and params
+    ap.add_argument("--detect_mode", choices=["gap_window", "per_round"], default="gap_window")
+    ap.add_argument("--window_len", type=int, default=10, help="window length for gap_window mode")
+    ap.add_argument("--warmup", type=int, default=10, help="warmup rounds for per_round mode")
+    ap.add_argument("--z_thresh", type=float, default=3.0, help="z threshold for per_round mode")
 
     # Optional: load a saved init checkpoint
     ap.add_argument("--ckpt", default="", help="optional resnet18_init.pth")
@@ -189,14 +223,16 @@ def main():
             rounds=args.rounds,
             infer_per_round=args.infer_per_round,
             do_detector=False,
-            nworkers=args.nworkers,
-            nbyz=args.nbyz,
             update_dim=args.update_dim,
             noise=args.noise,
             attack_scale=args.attack_scale,
             sample_interval_s=args.sample_interval,
             writer=writer,
             proc=proc,
+            detect_mode=args.detect_mode,
+            window_len=args.window_len,
+            warmup=args.warmup,
+            z_thresh=args.z_thresh,
         )
 
         print("Phase 2/2: inference + FLDetector")
@@ -207,14 +243,16 @@ def main():
             rounds=args.rounds,
             infer_per_round=args.infer_per_round,
             do_detector=True,
-            nworkers=args.nworkers,
-            nbyz=args.nbyz,
             update_dim=args.update_dim,
             noise=args.noise,
             attack_scale=args.attack_scale,
             sample_interval_s=args.sample_interval,
             writer=writer,
             proc=proc,
+            detect_mode=args.detect_mode,
+            window_len=args.window_len,
+            warmup=args.warmup,
+            z_thresh=args.z_thresh,
         )
 
     print(f"Done. Wrote {args.out_csv}")

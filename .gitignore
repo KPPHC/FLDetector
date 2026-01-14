@@ -11,3 +11,7 @@ data/
 datasets/
 *.tar.gz
 *.zip
+
+.python-version
+__pycache__/
+*.csv
