@@ -6,13 +6,18 @@ import pandas as pd
 def summarize(series: pd.Series):
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) == 0:
-        return {"mean": float("nan"), "p50": float("nan"), "p95": float("nan")}
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "p50": float("nan"),
+            "p95": float("nan"),
+        }
     return {
         "mean": s.mean(),
+        "std": s.std(),   # sample standard deviation
         "p50": s.quantile(0.50),
         "p95": s.quantile(0.95),
     }
-
 
 def main(csv_path: str) -> None:
     df = pd.read_csv(csv_path)
@@ -40,19 +45,19 @@ def main(csv_path: str) -> None:
         freq = summarize(d["cpu_freq_mhz"])
 
         print(
-            f"CPU%      mean={cpu['mean']:.2f}, "
+            f"CPU%      mean={cpu['mean']:.2f} ±{cpu['std']:.2f}, "
             f"p50={cpu['p50']:.2f}, p95={cpu['p95']:.2f}"
         )
         print(
-            f"RSS (MB)  mean={rss['mean']:.2f}, "
+            f"RSS (MB)  mean={rss['mean']:.2f} ±{rss['std']:.2f}, "
             f"p50={rss['p50']:.2f}, p95={rss['p95']:.2f}"
         )
         print(
-            f"TEMP (°C) mean={temp['mean']:.2f}, "
+            f"TEMP (°C) mean={temp['mean']:.2f} ±{temp['std']:.2f}, "
             f"p50={temp['p50']:.2f}, p95={temp['p95']:.2f}"
         )
         print(
-            f"FREQ (MHz) mean={freq['mean']:.0f}, "
+            f"FREQ (MHz) mean={freq['mean']:.0f} ±{freq['std']:.0f}, "
             f"p50={freq['p50']:.0f}, p95={freq['p95']:.0f}"
         )
 
@@ -62,7 +67,7 @@ def main(csv_path: str) -> None:
             stats = summarize(d[col])
             print(
                 f"  {col:<18} "
-                f"mean={stats['mean']:.6f}s "
+                f"mean={stats['mean']:.6f}s ±{stats['std']:.6f}s "
                 f"p50={stats['p50']:.6f}s "
                 f"p95={stats['p95']:.6f}s"
             )
@@ -74,10 +79,10 @@ def main(csv_path: str) -> None:
             print(
                 "\nDetector overhead:"
                 f"\n  detector/round  "
-                f"mean={frac.mean()*100:.2f}% "
+                f"mean={frac.mean()*100:.2f}% ±{frac.std()*100:.2f}% "
                 f"p50={frac.quantile(0.50)*100:.2f}% "
                 f"p95={frac.quantile(0.95)*100:.2f}%"
-            )
+            )   
 
         # ---- Context switches (per round deltas)
         if "vol_cs_delta" in d.columns:
@@ -85,8 +90,8 @@ def main(csv_path: str) -> None:
             invol = summarize(d["invol_cs_delta"])
             print(
                 "\nContext switches (per round):"
-                f"\n  voluntary     mean={vol['mean']:.2f}, p95={vol['p95']:.2f}"
-                f"\n  involuntary   mean={invol['mean']:.2f}, p95={invol['p95']:.2f}"
+                f"\n  voluntary     mean={vol['mean']:.2f} ±{vol['std']:.2f}, p95={vol['p95']:.2f}"
+                f"\n  involuntary   mean={invol['mean']:.2f} ±{invol['std']:.2f}, p95={invol['p95']:.2f}"
             )
 
 
